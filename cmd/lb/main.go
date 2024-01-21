@@ -6,6 +6,7 @@ import (
 	"net/http/httputil"
 	"net/url"
 	"sync"
+	"time"
 )
 
 // Backend defines the interface for a backend server
@@ -15,6 +16,7 @@ type Backend interface {
 	IsAlive() bool
 	GetURL() *url.URL
 	GetActiveConnections() int
+	PerformHealthCheck(interval time.Duration)
 }
 
 // backend is a simple round-robin load balancer
@@ -24,6 +26,7 @@ type backend struct {
 	activeConnections int
 	mutex             sync.RWMutex
 	reverseProxy      *httputil.ReverseProxy
+	healthCheckURL    string
 }
 
 func NewBackend(URL string) Backend {
@@ -33,9 +36,10 @@ func NewBackend(URL string) Backend {
 	}
 
 	return &backend{
-		URL:          u,
-		alive:        true,
-		reverseProxy: httputil.NewSingleHostReverseProxy(u),
+		URL:            u,
+		alive:          true,
+		reverseProxy:   httputil.NewSingleHostReverseProxy(u),
+		healthCheckURL: URL + "/health", // Assuming a simple health check endpoint at /health
 	}
 }
 
@@ -84,6 +88,39 @@ func (b *backend) GetActiveConnections() int {
 	b.mutex.RLock()
 	defer b.mutex.RUnlock()
 	return b.activeConnections
+}
+
+// PerformHealthCheck periodically checks if the backend server is alive
+func (b *backend) PerformHealthCheck(interval time.Duration) {
+	ticker := time.NewTicker(interval)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-ticker.C:
+			if err := b.checkHealth(); err != nil {
+				fmt.Printf("Health check failed for %s: %s\n", b.healthCheckURL, err)
+				b.SetAlive(false)
+			} else {
+				fmt.Printf("Health check passed for %s\n", b.healthCheckURL)
+				b.SetAlive(true)
+			}
+		}
+	}
+}
+
+func (b *backend) checkHealth() error {
+	resp, err := http.Get(b.healthCheckURL)
+	if err != nil {
+		return err
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		return fmt.Errorf("unexpected status code: %d", resp.StatusCode)
+	}
+
+	return nil
 }
 
 // ServerPool represents a pool of backend servers
@@ -137,6 +174,9 @@ func (sp *RoundRobinServerPool) AddBackend(backend Backend) {
 	sp.mutex.Lock()
 	defer sp.mutex.Unlock()
 	sp.backends = append(sp.backends, backend)
+
+	// Start health check for the new backend
+	go backend.PerformHealthCheck(10 * time.Second) // Adjust the interval as needed
 }
 
 // GetServerPoolSize returns the number of backend servers in the pool
